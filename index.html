@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Antibot Sensor Probe</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font: 14px/1.5 -apple-system, system-ui, sans-serif;
+    margin: 0; padding: 12px; max-width: 760px; margin: 0 auto;
+  }
+  h1 { font-size: 18px; margin: 4px 0 2px; }
+  .sub { opacity: .65; font-size: 12px; margin-bottom: 12px; }
+  .ctx { padding: 8px 10px; border-radius: 8px; font-size: 12px; margin-bottom: 12px; }
+  .ctx.ok  { background: #0a3; color: #fff; }
+  .ctx.bad { background: #c30; color: #fff; }
+  .grp { border: 1px solid rgba(128,128,128,.35); border-radius: 10px; margin: 10px 0; overflow: hidden; }
+  .grp h2 { font-size: 13px; margin: 0; padding: 8px 10px; background: rgba(128,128,128,.12); }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { padding: 6px 10px; text-align: left; border-top: 1px solid rgba(128,128,128,.2); vertical-align: top; }
+  th { font-weight: 600; font-size: 11px; opacity: .6; text-transform: uppercase; }
+  .sig { font-weight: 600; white-space: nowrap; }
+  .val { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+  .b-yes  { background: #0a3; color: #fff; }
+  .b-no   { background: #c30; color: #fff; }
+  .b-perm { background: #e80; color: #fff; }
+  .b-stub { background: #a70; color: #fff; }
+  .b-wait { background: #789; color: #fff; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; position: sticky; top: 0; padding: 8px 0; background: Canvas; z-index: 5; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid rgba(128,128,128,.5); background: rgba(128,128,128,.12); cursor: pointer; }
+  button:active { transform: translateY(1px); }
+  #out { width: 100%; height: 160px; font-family: ui-monospace, monospace; font-size: 11px; margin-top: 8px; display: none; }
+  .hint { font-size: 11px; opacity: .6; padding: 0 10px 8px; }
+</style>
+</head>
+<body>
+<h1>Antibot Sensor Probe</h1>
+<div class="sub">Замер доступности браузерных сигналов. Ничего не скорит. Данные не покидают устройство до нажатия «Выгрузить JSON».</div>
+
+<div id="ctx" class="ctx">проверка контекста…</div>
+
+<div class="bar">
+  <button id="askMotion">Включить сенсоры движения (iOS)</button>
+  <button id="dump">Выгрузить JSON</button>
+  <button id="copy">Копировать</button>
+</div>
+<textarea id="out" readonly></textarea>
+
+<!-- Static fingerprint -->
+<div class="grp">
+  <h2>Fingerprint (собран при загрузке)</h2>
+  <table><thead><tr><th>Сигнал</th><th>Значение</th><th>Статус</th></tr></thead>
+  <tbody id="fp"></tbody></table>
+</div>
+
+<!-- Live behaviour -->
+<div class="grp">
+  <h2>Поведение (двигай мышью / скролль / тапай)</h2>
+  <div class="hint">Считаем частоту событий. Ноль-активность = сигнал бота.</div>
+  <table><thead><tr><th>Сигнал</th><th>Значение</th><th>Статус</th></tr></thead>
+  <tbody id="beh"></tbody></table>
+</div>
+
+<!-- Mobile sensors -->
+<div class="grp">
+  <h2>Мобильные сенсоры (главный red flag)</h2>
+  <div class="hint">iOS Safari: жми «Включить сенсоры движения» — требует жеста. Android Chrome: часто без спроса.</div>
+  <table><thead><tr><th>Сигнал</th><th>Значение</th><th>Статус</th></tr></thead>
+  <tbody id="mob"></tbody></table>
+</div>
+
+<script>
+"use strict";
+
+// ---- helpers ----------------------------------------------------------
+const rows = {}; // key -> {td_val, td_badge}
+function row(tbodyId, key, label) {
+  const tb = document.getElementById(tbodyId);
+  const tr = document.createElement("tr");
+  const c1 = document.createElement("td"); c1.className = "sig"; c1.textContent = label;
+  const c2 = document.createElement("td"); c2.className = "val"; c2.textContent = "—";
+  const c3 = document.createElement("td");
+  tr.append(c1, c2, c3); tb.appendChild(tr);
+  rows[key] = { val: c2, badge: c3 };
+  return rows[key];
+}
+function setVal(key, v) { if (rows[key]) rows[key].val.textContent = v; }
+function setBadge(key, kind, text) {
+  if (!rows[key]) return;
+  rows[key].badge.innerHTML = '<span class="badge b-' + kind + '">' + text + '</span>';
+}
+// state accumulator for JSON export; each signal writes {available, realData, needsPermission, stable, value}
+const REPORT = { collectedAt: new Date().toISOString(), signals: {} };
+function report(key, obj) { REPORT.signals[key] = Object.assign(REPORT.signals[key] || {}, obj); }
+
+// ---- 0. secure context ------------------------------------------------
+(function () {
+  const el = document.getElementById("ctx");
+  const secure = window.isSecureContext;
+  const proto = location.protocol;
+  if (secure) {
+    el.className = "ctx ok";
+    el.textContent = "Secure context OK (" + proto + "). Сенсоры и permission доступны.";
+  } else {
+    el.className = "ctx bad";
+    el.textContent = "НЕ secure context (" + proto + "). DeviceMotion/permission API будут урезаны. "
+      + "Открой через https:// или localhost, иначе мобильный вердикт невалиден.";
+  }
+  REPORT.context = { secureContext: secure, protocol: proto, href: location.href };
+})();
+
+// ---- 1. fingerprint ---------------------------------------------------
+function stub(v) { return v === undefined || v === null; }
+
+(function fingerprint() {
+  const n = navigator, s = screen;
+
+  const items = [
+    ["ua",        "User-Agent",        n.userAgent],
+    ["platform",  "platform",          n.platform],
+    ["cores",     "hardwareConcurrency", n.hardwareConcurrency],
+    ["mem",       "deviceMemory (GB)", n.deviceMemory],
+    ["screen",    "screen WxH",        s.width + "x" + s.height + " @" + s.colorDepth + "bit"],
+    ["dpr",       "devicePixelRatio",  window.devicePixelRatio],
+    ["tz",        "timezone",          Intl.DateTimeFormat().resolvedOptions().timeZone],
+    ["lang",      "languages",         (n.languages || [n.language]).join(",")],
+    ["touch",     "maxTouchPoints",    n.maxTouchPoints],
+  ];
+  for (const [k, label, v] of items) {
+    row("fp", k, label);
+    setVal(k, stub(v) ? "(нет)" : String(v));
+    const ok = !stub(v);
+    setBadge(k, ok ? "yes" : "no", ok ? "есть" : "нет");
+    report(k, { available: ok, realData: ok, needsPermission: false, value: v == null ? null : String(v) });
+  }
+
+  // canvas fingerprint
+  row("fp", "canvas", "Canvas FP hash");
+  try {
+    const cv = document.createElement("canvas");
+    cv.width = 200; cv.height = 40;
+    const ctx = cv.getContext("2d");
+    ctx.textBaseline = "top"; ctx.font = "16px Arial";
+    ctx.fillStyle = "#f60"; ctx.fillRect(0, 0, 200, 40);
+    ctx.fillStyle = "#069"; ctx.fillText("antibot-probe-\u{1F916}", 2, 2);
+    const data = cv.toDataURL();
+    let h = 0; for (let i = 0; i < data.length; i++) { h = (h * 31 + data.charCodeAt(i)) | 0; }
+    const hex = (h >>> 0).toString(16);
+    setVal("canvas", hex);
+    setBadge("canvas", "yes", "есть");
+    report("canvas", { available: true, realData: true, needsPermission: false, value: hex });
+  } catch (e) {
+    setVal("canvas", "(заблокирован)");
+    setBadge("canvas", "no", "нет");
+    report("canvas", { available: false, realData: false, error: String(e) });
+  }
+
+  // WebGL GPU
+  row("fp", "gpu", "WebGL renderer (GPU)");
+  try {
+    const gl = document.createElement("canvas").getContext("webgl");
+    const dbg = gl && gl.getExtension("WEBGL_debug_renderer_info");
+    const gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null;
+    if (gpu) {
+      setVal("gpu", gpu); setBadge("gpu", "yes", "есть");
+      report("gpu", { available: true, realData: true, value: gpu });
+    } else {
+      setVal("gpu", "(скрыт браузером)"); setBadge("gpu", "stub", "скрыт");
+      report("gpu", { available: !!gl, realData: false, value: null });
+    }
+  } catch (e) {
+    setVal("gpu", "(нет WebGL)"); setBadge("gpu", "no", "нет");
+    report("gpu", { available: false, realData: false, error: String(e) });
+  }
+})();
+
+// ---- 2. behaviour rates ----------------------------------------------
+(function behaviour() {
+  const defs = [
+    ["mousemove", "mousemove /сек"],
+    ["scroll",    "scroll (всего)"],
+    ["click",     "click (всего)"],
+    ["touchmove", "touchmove /сек"],
+    ["pointermove", "pointermove /сек"],
+  ];
+  for (const [k, label] of defs) { row("beh", k, label); setBadge(k, "wait", "жду ввод"); }
+
+  const cnt = { mousemove: 0, scroll: 0, click: 0, touchmove: 0, pointermove: 0 };
+  const tot = { mousemove: 0, scroll: 0, click: 0, touchmove: 0, pointermove: 0 };
+  const seen = {};
+
+  function bump(k) { cnt[k]++; tot[k]++; if (!seen[k]) { seen[k] = true; setBadge(k, "yes", "есть данные"); } }
+
+  addEventListener("mousemove",   () => bump("mousemove"),   { passive: true });
+  addEventListener("scroll",      () => bump("scroll"),      { passive: true });
+  addEventListener("click",       () => bump("click"),       { passive: true });
+  addEventListener("touchmove",   () => bump("touchmove"),   { passive: true });
+  addEventListener("pointermove", () => bump("pointermove"), { passive: true });
+
+  // per-second rate refresh
+  setInterval(() => {
+    for (const k of ["mousemove", "touchmove", "pointermove"]) {
+      setVal(k, cnt[k] + " /сек (Σ" + tot[k] + ")");
+      report(k, { available: true, realData: seen[k] || false, needsPermission: false, ratePerSec: cnt[k], total: tot[k] });
+      cnt[k] = 0;
+    }
+    for (const k of ["scroll", "click"]) {
+      setVal(k, String(tot[k]));
+      report(k, { available: true, realData: seen[k] || false, needsPermission: false, total: tot[k] });
+    }
+  }, 1000);
+})();
+
+// ---- 3. mobile sensors -----------------------------------------------
+(function mobile() {
+  row("mob", "pressure",   "PointerEvent.pressure");
+  row("mob", "touchRadius","Touch radiusX/Y");
+  row("mob", "motion",     "DeviceMotion (accel)");
+  row("mob", "orient",     "DeviceOrientation (compass)");
+
+  // --- pressure + radius: sampled from pointer/touch, detect stub values
+  let pSamples = [], rSamples = [];
+  setBadge("pressure", "wait", "жду тач"); setBadge("touchRadius", "wait", "жду тач");
+
+  addEventListener("pointerdown", collectPointer, { passive: true });
+  addEventListener("pointermove", collectPointer, { passive: true });
+  function collectPointer(e) {
+    if (e.pressure !== undefined) pSamples.push(e.pressure);
+    if (pSamples.length > 200) pSamples.shift();
+  }
+  addEventListener("touchmove", (e) => {
+    const t = e.touches[0];
+    if (t && t.radiusX !== undefined) rSamples.push(t.radiusX + "/" + t.radiusY);
+    if (rSamples.length > 100) rSamples.shift();
+  }, { passive: true });
+
+  setInterval(() => {
+    if (pSamples.length) {
+      const uniq = [...new Set(pSamples)];
+      const stubLike = uniq.length <= 2 && (uniq.every(v => v === 0 || v === 0.5 || v === 1));
+      setVal("pressure", "uniq=[" + uniq.slice(0, 6).join(",") + "] n=" + pSamples.length);
+      setBadge("pressure", stubLike ? "stub" : "yes", stubLike ? "ЗАГЛУШКА" : "реальные");
+      report("pressure", {
+        available: true, realData: !stubLike, needsPermission: false,
+        uniqueValues: uniq.slice(0, 12), samples: pSamples.length,
+        note: stubLike ? "константа/бинар -> на вебе бесполезно" : "варьируется"
+      });
+    }
+    if (rSamples.length) {
+      const uniq = [...new Set(rSamples)];
+      const stubLike = uniq.length === 1;
+      setVal("touchRadius", "uniq=" + uniq.length + " напр. " + rSamples[rSamples.length - 1]);
+      setBadge("touchRadius", stubLike ? "stub" : "yes", stubLike ? "константа" : "реальные");
+      report("touchRadius", { available: true, realData: !stubLike, samples: rSamples.length });
+    }
+  }, 1000);
+
+  // --- DeviceMotion / Orientation with iOS permission gate
+  const needIOSPerm = typeof DeviceMotionEvent !== "undefined"
+    && typeof DeviceMotionEvent.requestPermission === "function";
+
+  if (typeof DeviceMotionEvent === "undefined") {
+    setVal("motion", "API отсутствует"); setBadge("motion", "no", "нет API");
+    report("motion", { available: false, realData: false });
+  } else if (needIOSPerm) {
+    setVal("motion", "нужен permission-жест"); setBadge("motion", "perm", "нужен permission");
+    report("motion", { available: true, realData: false, needsPermission: true });
+  } else {
+    setVal("motion", "слушаю…"); setBadge("motion", "wait", "жду данные");
+    report("motion", { available: true, realData: false, needsPermission: false });
+  }
+
+  if (typeof DeviceOrientationEvent === "undefined") {
+    setVal("orient", "API отсутствует"); setBadge("orient", "no", "нет API");
+    report("orient", { available: false, realData: false });
+  } else if (typeof DeviceOrientationEvent.requestPermission === "function") {
+    setVal("orient", "нужен permission-жест"); setBadge("orient", "perm", "нужен permission");
+    report("orient", { available: true, realData: false, needsPermission: true });
+  } else {
+    setVal("orient", "слушаю…"); setBadge("orient", "wait", "жду данные");
+    report("orient", { available: true, realData: false, needsPermission: false });
+  }
+
+  let mHits = 0, oHits = 0;
+  function onMotion(e) {
+    mHits++;
+    const a = e.accelerationIncludingGravity || e.acceleration || {};
+    const nonZero = [a.x, a.y, a.z].some(v => v != null && Math.abs(v) > 0.01);
+    setVal("motion", "x=" + fmt(a.x) + " y=" + fmt(a.y) + " z=" + fmt(a.z) + " (n=" + mHits + ")");
+    setBadge("motion", nonZero ? "yes" : "stub", nonZero ? "реальные" : "ноль/заглушка");
+    report("motion", { available: true, realData: nonZero, needsPermission: needIOSPerm, hits: mHits,
+      sample: { x: a.x, y: a.y, z: a.z } });
+  }
+  function onOrient(e) {
+    oHits++;
+    const nonZero = [e.alpha, e.beta, e.gamma].some(v => v != null && Math.abs(v) > 0.01);
+    setVal("orient", "α=" + fmt(e.alpha) + " β=" + fmt(e.beta) + " γ=" + fmt(e.gamma) + " (n=" + oHits + ")");
+    setBadge("orient", nonZero ? "yes" : "stub", nonZero ? "реальные" : "ноль/заглушка");
+    report("orient", { available: true, realData: nonZero, hits: oHits,
+      sample: { alpha: e.alpha, beta: e.beta, gamma: e.gamma } });
+  }
+  function fmt(v) { return v == null ? "–" : v.toFixed(1); }
+
+  function attach() {
+    addEventListener("devicemotion", onMotion);
+    addEventListener("deviceorientation", onOrient);
+  }
+  if (!needIOSPerm) attach(); // Android / desktop: attach immediately
+
+  document.getElementById("askMotion").addEventListener("click", async () => {
+    try {
+      if (needIOSPerm) {
+        const r1 = await DeviceMotionEvent.requestPermission();
+        report("motion", { permissionResult: r1 });
+        if (typeof DeviceOrientationEvent.requestPermission === "function") {
+          const r2 = await DeviceOrientationEvent.requestPermission();
+          report("orient", { permissionResult: r2 });
+        }
+      }
+      attach();
+      setVal("motion", "разрешено, слушаю…");
+    } catch (e) {
+      setVal("motion", "permission ошибка: " + e);
+      report("motion", { permissionError: String(e) });
+    }
+  });
+})();
+
+// ---- 4. export --------------------------------------------------------
+document.getElementById("dump").addEventListener("click", () => {
+  const out = document.getElementById("out");
+  out.style.display = "block";
+  out.value = JSON.stringify(REPORT, null, 2);
+});
+document.getElementById("copy").addEventListener("click", async () => {
+  const txt = JSON.stringify(REPORT, null, 2);
+  try { await navigator.clipboard.writeText(txt); alert("Скопировано"); }
+  catch (e) {
+    const out = document.getElementById("out");
+    out.style.display = "block"; out.value = txt; out.select();
+  }
+});
+</script>
+</body>
+</html>
