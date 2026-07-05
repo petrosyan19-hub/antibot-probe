@@ -217,13 +217,21 @@ function stub(v) { return v === undefined || v === null; }
 // ---- 3. mobile sensors -----------------------------------------------
 (function mobile() {
   row("mob", "pressure",   "PointerEvent.pressure");
+  row("mob", "force",      "Touch.force (iOS)");
   row("mob", "touchRadius","Touch radiusX/Y");
   row("mob", "motion",     "DeviceMotion (accel)");
   row("mob", "orient",     "DeviceOrientation (compass)");
 
-  // --- pressure + radius: sampled from pointer/touch, detect stub values
-  let pSamples = [], rSamples = [];
-  setBadge("pressure", "wait", "жду тач"); setBadge("touchRadius", "wait", "жду тач");
+  // --- pressure + force + radius: sampled from pointer/touch, detect stub values
+  let pSamples = [], fSamples = [], rSamples = [];
+  setBadge("pressure", "wait", "жду тач");
+  setBadge("force", "wait", "жду тач");
+  setBadge("touchRadius", "wait", "жду тач");
+
+  // Touch.force API presence (iOS Safari exposes it; Chrome/desktop usually not)
+  const forceApi = (typeof Touch !== "undefined") && ("force" in Touch.prototype);
+  if (!forceApi) { setVal("force", "API отсутствует"); setBadge("force", "no", "нет API"); }
+  report("force", { available: forceApi, realData: false, needsPermission: false });
 
   addEventListener("pointerdown", collectPointer, { passive: true });
   addEventListener("pointermove", collectPointer, { passive: true });
@@ -231,11 +239,19 @@ function stub(v) { return v === undefined || v === null; }
     if (e.pressure !== undefined) pSamples.push(e.pressure);
     if (pSamples.length > 200) pSamples.shift();
   }
-  addEventListener("touchmove", (e) => {
+  // Touch.force + radius live on TouchEvent, not PointerEvent — sample from touchstart/move
+  addEventListener("touchstart", collectTouch, { passive: true });
+  addEventListener("touchmove",  collectTouch, { passive: true });
+  function collectTouch(e) {
     const t = e.touches[0];
-    if (t && t.radiusX !== undefined) rSamples.push(t.radiusX + "/" + t.radiusY);
-    if (rSamples.length > 100) rSamples.shift();
-  }, { passive: true });
+    if (!t) return;
+    if (t.force !== undefined) { fSamples.push(t.force); if (fSamples.length > 200) fSamples.shift(); }
+    if (t.radiusX !== undefined) {
+      rSamples.push(round2(t.radiusX) + "/" + round2(t.radiusY));
+      if (rSamples.length > 100) rSamples.shift();
+    }
+  }
+  function round2(v) { return v == null ? "?" : Math.round(v * 100) / 100; }
 
   setInterval(() => {
     if (pSamples.length) {
@@ -249,12 +265,26 @@ function stub(v) { return v === undefined || v === null; }
         note: stubLike ? "константа/бинар -> на вебе бесполезно" : "варьируется"
       });
     }
+    if (fSamples.length) {
+      const uniq = [...new Set(fSamples)];
+      // iOS reports 0 when no force info; real Force Touch varies continuously in (0,1]
+      const allZero = uniq.every(v => v === 0);
+      const stubLike = allZero || (uniq.length <= 2 && uniq.every(v => v === 0 || v === 1));
+      setVal("force", "uniq=[" + uniq.slice(0, 6).join(",") + "] n=" + fSamples.length);
+      setBadge("force", stubLike ? "stub" : "yes", stubLike ? (allZero ? "всегда 0" : "ЗАГЛУШКА") : "реальные");
+      report("force", {
+        available: true, realData: !stubLike, needsPermission: false,
+        uniqueValues: uniq.slice(0, 12), samples: fSamples.length,
+        note: allZero ? "force=0 -> нет Force Touch на девайсе" : (stubLike ? "бинар -> бесполезно" : "варьируется")
+      });
+    }
     if (rSamples.length) {
       const uniq = [...new Set(rSamples)];
       const stubLike = uniq.length === 1;
       setVal("touchRadius", "uniq=" + uniq.length + " напр. " + rSamples[rSamples.length - 1]);
       setBadge("touchRadius", stubLike ? "stub" : "yes", stubLike ? "константа" : "реальные");
-      report("touchRadius", { available: true, realData: !stubLike, samples: rSamples.length });
+      report("touchRadius", { available: true, realData: !stubLike, samples: rSamples.length,
+        uniqueValues: uniq.slice(0, 12) });
     }
   }, 1000);
 
